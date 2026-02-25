@@ -85,6 +85,14 @@ def _safe_int(x: Any, default: int = 0) -> int:
         return int(default)
 
 
+def _first_valid_float(values: Sequence[Any], default: float = float("nan")) -> float:
+    for v in values:
+        x = _safe_float(v, np.nan)
+        if np.isfinite(x):
+            return float(x)
+    return float(default)
+
+
 def _parse_date_flexible(raw: Any) -> Optional[datetime]:
     if raw is None:
         return None
@@ -376,6 +384,14 @@ def pull_historical_option_data(
             df["strike_price"] = _safe_float(c.get("_strike"), np.nan)
             df["option_type"] = c.get("_option_type") or _option_type(c)
             df["trading_symbol"] = str(c.get("trading_symbol") or c.get("symbol") or "")
+            # Keep a stable, non-zero spot fallback for downstream feature building.
+            # This is never set to strike; rows with truly invalid spot are skipped later.
+            df["spot_hint"] = _safe_float(spot_hint, np.nan)
+            if "underlying_spot_price" not in df.columns:
+                df["underlying_spot_price"] = np.nan
+            df["underlying_spot_price"] = pd.to_numeric(df["underlying_spot_price"], errors="coerce")
+            if np.isfinite(_safe_float(spot_hint, np.nan)) and _safe_float(spot_hint, np.nan) > 0:
+                df["underlying_spot_price"] = df["underlying_spot_price"].fillna(float(spot_hint))
             all_candles.append(df)
 
     if all_candles:
@@ -501,9 +517,18 @@ def _compute_model_residual_labels(
         # Spot proxy:
         # expired options do not always provide synchronized underlying history in this endpoint.
         # Use strike as stable fallback proxy when spot is unavailable.
-        spot_proxy = _safe_float(getattr(row, "underlying_spot_price", np.nan), np.nan)
+        spot_proxy = _first_valid_float(
+            (
+                getattr(row, "underlying_spot_price", np.nan),
+                getattr(row, "spot_price", np.nan),
+                getattr(row, "spot", np.nan),
+                getattr(row, "underlying_price", np.nan),
+                getattr(row, "spot_hint", np.nan),
+            ),
+            default=np.nan,
+        )
         if not np.isfinite(spot_proxy) or spot_proxy <= 0:
-            # CRITICAL BUG FIX (v5.1): Never fabricate moneyness. 
+            # CRITICAL BUG FIX (v5.1): Never fabricate moneyness.
             # Defaulting spot to strike corrupts IV and the entire ML dataset.
             continue
 
@@ -546,7 +571,16 @@ def _compute_model_residual_labels(
 def _build_omega_features(row: pd.Series, config: HistoricalLearningConfig) -> Dict[str, float]:
     from omega_model import FeatureFactory  # noqa: WPS433
 
-    spot = _safe_float(row.get("underlying_spot_price", np.nan), np.nan)
+    spot = _first_valid_float(
+        (
+            row.get("underlying_spot_price", np.nan),
+            row.get("spot_price", np.nan),
+            row.get("spot", np.nan),
+            row.get("underlying_price", np.nan),
+            row.get("spot_hint", np.nan),
+        ),
+        default=np.nan,
+    )
     strike = _safe_float(row.get("strike_price", np.nan), np.nan)
     if not np.isfinite(spot) or spot <= 0 or not np.isfinite(strike) or strike <= 0:
         # Cannot build features without valid spot and strike.
@@ -622,7 +656,10 @@ def _evaluate_ml_on_df(ml: Any, df: pd.DataFrame, config: HistoricalLearningConf
         target = _safe_float(row_s.get("residual_label", np.nan), np.nan)
         if not np.isfinite(target):
             continue
-        feats = _build_omega_features(row_s, config)
+        try:
+            feats = _build_omega_features(row_s, config)
+        except ValueError:
+            continue
         pred, _ = ml.predict_correction(feats)
         preds.append(float(pred))
         actual.append(float(target))
@@ -698,7 +735,10 @@ def _walk_forward_evaluate(valid_df: pd.DataFrame, config: HistoricalLearningCon
         ml = MLPricingCorrector(model_path=str(tmp_model_path))
         for row in train_df.itertuples(index=False):
             row_s = pd.Series(row._asdict())
-            feats = _build_omega_features(row_s, config)
+            try:
+                feats = _build_omega_features(row_s, config)
+            except ValueError:
+                continue
             target = float(row_s.get("residual_label", 0.0))
             _append_training_sample_without_retrain(ml, feats, target)
         if hasattr(ml, "_train"):
@@ -776,7 +816,10 @@ def train_or_update_ml_corrector(
     ml = MLPricingCorrector(model_path=config.model_path)
     for row in train_df.itertuples(index=False):
         row_s = pd.Series(row._asdict())
-        feats = _build_omega_features(row_s, config)
+        try:
+            feats = _build_omega_features(row_s, config)
+        except ValueError:
+            continue
         target = float(row_s.get("residual_label", 0.0))
         _append_training_sample_without_retrain(ml, feats, target)
 
