@@ -91,13 +91,14 @@ def test_compute_model_residual_labels_with_mocked_nirv():
     try:
         ts = pd.date_range("2024-01-01", periods=35, freq="D", tz="UTC")
         df = pd.DataFrame(
-            {
-                "timestamp": ts,
-                "instrument_key": ["NSE_FO|X"] * len(ts),
-                "strike_price": [22000] * len(ts),
-                "close": np.linspace(90, 110, len(ts)),
-                "expiry_date": ["2024-02-29"] * len(ts),
-                "option_type": ["CE"] * len(ts),
+                {
+                    "timestamp": ts,
+                    "instrument_key": ["NSE_FO|X"] * len(ts),
+                    "underlying_spot_price": [22100.0] * len(ts),
+                    "strike_price": [22000] * len(ts),
+                    "close": np.linspace(90, 110, len(ts)),
+                    "expiry_date": ["2024-02-29"] * len(ts),
+                    "option_type": ["CE"] * len(ts),
                 "log_ret_1": np.random.normal(0, 0.01, len(ts)),
                 "rv_20": [0.2] * len(ts),
             }
@@ -150,4 +151,3 @@ def test_pull_and_train_writes_artifacts(tmp_path, monkeypatch):
     assert Path(artifacts["raw_contracts_path"]).exists()
     assert Path(artifacts["processed_features_path"]).exists()
     assert Path(artifacts["training_report_path"]).exists()
-
